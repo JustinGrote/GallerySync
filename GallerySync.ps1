@@ -5,9 +5,9 @@ param(
 	#How many to download in a single batch from the gallery. The max for this is 100
 	$downloadBatchSize = 100,
 	#How many to batch before sending to Sleet. The max is recommended to be less than 4096 since Sleet will batch it anyways at that size. Ensure you have enough disk space to support this number of packages.
-	$processBatchSize = 500,
+	$processBatchSize = $ENV:PROCESS_BATCH_SIZE ?? 500,
 	#How many days to go back in history if no checkpoint has been detected yet.
-	$defaultHistoryDays = 7,
+	$defaultHistoryDays = $ENV:DEFAULT_HISTORY_DAYS ?? 7,
 	$concurrentDownloads = 30
 )
 
@@ -25,11 +25,12 @@ $checkpointPath = $($ENV:SLEET_FEED_PATH + "/$checkpointName")
 	(Get-Date).AddDays(-$defaultHistoryDays).ToString('o')
 }
 "Checkpoint: $checkpoint"
-
+$processed = 0
 $i = 0
-
+$processLastBatch = $false
+$firstScan = $true
 while ($true) {
-	Write-Host "Processing batch $i"
+	Write-Host "Retriving package info $i-$($i + $downloadBatchSize) from Gallery"
 	$irmParams = @{
 		Uri  = 'https://www.powershellgallery.com/api/v2/Search()'
 		Body = @{
@@ -42,23 +43,41 @@ while ($true) {
 		}
 	}
 	$packages = Invoke-RestMethod @irmParams
-	if (-not $packages) { 'All packages processed'; break }
+	if (-not $packages) {
+		if ($firstScan) { Write-Host 'No New Packages Detected'; return }
 
-	$i += $downloadBatchSize
-	$packages | ForEach-Object -Throttle $concurrentDownloads -Parallel {
-		Write-Host "Downloading $($_.content.src)"
-		Invoke-WebRequest $PSItem.content.src -OutFile "$(New-Guid).nupkg"
+		if ((Get-Item $PWD\*.nupkg).Count) {
+			Write-Host 'No packages found, processing last batch'
+			$processLastBatch = $true
+		} else {
+			"$processed Packages Processed"; break
+		}
+	} else {
+		$newCheckpoint = $packages[-1].properties.Created.'#text'
 	}
-	if ((Get-Item $PWD\*.nupkg).Count -lt $processBatchSize) {
-		Write-Host "Batch size of $($packages.Count) does not yet meet process size of $processBatchSize. Fetching more packages."
+	$firstScan = $false
+
+	if (-not $processLastBatch) {
+		$i += $downloadBatchSize
+		Write-Host "Downloading $($packages.count) packages"
+		$packages | ForEach-Object -Throttle $concurrentDownloads -Parallel {
+			# Write-Host "Downloading $($_.content.src)"
+			Invoke-WebRequest $PSItem.content.src -OutFile "$(New-Guid).nupkg"
+		}
+	}
+
+	$onDiskPackageCount = (Get-Item $PWD\*.nupkg).Count
+	if (-not $processLastBatch -and $onDiskPackageCount -lt $processBatchSize) {
+		Write-Host "Batch size of $onDiskPackageCount does not yet meet process size of $processBatchSize. Fetching more packages."
 		continue
 	}
-	Write-Host "Processing batch of $($packages.Count) packages"
+	Write-Host "Processing batch of $onDiskPackageCount packages"
 
 	& sleet push --skip-existing $PWD
-	$newCheckpoint = $packages[-1].properties.Created.'#text'
 	if (-not $newCheckpoint) { throw 'No Created date found on last package in batch. This is a bug' }
 	Set-AzBlobContent -Uri $checkpointPath -Content $newCheckpoint
 	Write-Host "Checkpoint Rolled Forward to: $newCheckpoint"
+	$processed += (Get-Item -Path $PWD\*.nupkg).Count
 	Remove-Item -Path $PWD\*.nupkg -Force
+	if ($processLastBatch) { "$processed Packages Processed"; break }
 }
