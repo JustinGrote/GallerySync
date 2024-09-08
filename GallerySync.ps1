@@ -53,7 +53,8 @@ while ($true) {
 			"$processed Packages Processed"; break
 		}
 	} else {
-		$newCheckpoint = $packages[-1].properties.Created.'#text'
+		$package = $packages.count -eq 1 ? $packages : $packages[-1]
+		$newCheckpoint = $package.properties.Created.'#text'
 	}
 	$firstScan = $false
 
