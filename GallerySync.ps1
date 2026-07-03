@@ -14,8 +14,50 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$token = Get-AzToken -ClientId $env:AZURE_CLIENT_ID -TenantId $ENV:AZURE_TENANT_ID -ClientSecret $env:AZURE_CLIENT_SECRET -Resource 'https://storage.azure.com'
-Set-AzBlobContext -Token ($token.Token | ConvertTo-SecureString -AsPlainText)
+if (-not (Get-Command sleet)) {
+	Write-Host 'Sleet not found in path. Please ensure Sleet is installed and available in the path.'
+	exit 1
+}
+
+function Get-AzManagedIdentityToken {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)]
+		[string]$Resource,
+		[string]$ClientId
+	)
+	if (-not $env:IDENTITY_ENDPOINT) {
+		throw 'Managed Identity has not been enabled in this environment (IDENTITY_ENDPOINT env varis not set).'
+	}
+	if (-not $env:IDENTITY_HEADER) {
+		throw 'Managed Identity has not been enabled in this environment (IDENTITY_HEADER env varis not set).'
+	}
+	$irmParams = @{
+		Uri         = $env:IDENTITY_ENDPOINT + "?api-version=2019-08-01&resource=$Resource"
+		Headers     = @{
+			'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER
+			'Metadata'          = 'true'
+		}
+		Method      = 'GET'
+		ContentType = 'application/json'
+		# Body = @{
+		# 	'api-version' = '2019-08-01'
+		# 	resource = $Resource
+		# }
+	}
+	# if ($ClientId) {
+	# 	$irmParams.Body.client_id = $ClientId
+	# }
+	$response = Invoke-RestMethod @irmParams
+	if (-not $response.access_token) {
+		throw 'Managed Identity token could not be retrieved. (No access_token in response)'
+	}
+	return $response.access_token | ConvertTo-SecureString -AsPlainText
+}
+
+$token = Get-AzManagedIdentityToken -Resource 'https://storage.azure.com'
+Set-AzBlobContext -Token $token
+
 $checkpointPath = $($ENV:SLEET_FEED_PATH + "/$checkpointName")
 [string]$checkpoint = try {
 	Get-AzBlobContent -Uri $checkpointPath
@@ -29,56 +71,94 @@ $processed = 0
 $i = 0
 $processLastBatch = $false
 $firstScan = $true
+$SCRIPT:newCheckpoint = $null
 while ($true) {
-	Write-Host "Retriving package info $i-$($i + $downloadBatchSize) from Gallery"
+	Write-Host "Retrieving package info $i-$($i + $downloadBatchSize) from Gallery since $SCRIPT:newCheckpoint"
 	$irmParams = @{
-		Uri  = 'https://www.powershellgallery.com/api/v2/Search()'
+		Uri  = 'https://www.powershellgallery.com/api/v2/Packages'
 		Body = @{
-			'$filter'         = "Published gt datetime'$checkpoint'"
-			'$orderby'        = 'Published'
-			'$inlinecount'    = 'allpages'
+			'$filter'         = "Created gt datetime'$checkpoint'"
+			'$orderby'        = 'Created'
+			'$select'         = 'Created'
 			'$skip'           = $i
 			'$top'            = $downloadBatchSize
 			includePrerelease = $true
 		}
 	}
-	$packages = Invoke-RestMethod @irmParams
-	if (-not $packages) {
-		if ($firstScan) { Write-Host 'No New Packages Detected'; return }
-
-		if ((Get-Item $PWD\*.nupkg).Count) {
-			Write-Host 'No packages found, processing last batch'
-			$processLastBatch = $true
-		} else {
-			"$processed Packages Processed"; break
-		}
-	} else {
-		$package = $packages.count -eq 1 ? $packages : $packages[-1]
-		$newCheckpoint = $package.properties.Created.'#text'
-	}
-	$firstScan = $false
-
-	if (-not $processLastBatch) {
-		$i += $downloadBatchSize
-		Write-Host "Downloading $($packages.count) packages"
-		$packages | ForEach-Object -Throttle $concurrentDownloads -Parallel {
-			# Write-Host "Downloading $($_.content.src)"
-			Invoke-WebRequest $PSItem.content.src -OutFile "$(New-Guid).nupkg"
+	try {
+		[Array[]]$packages = Invoke-RestMethod @irmParams
+	} catch {
+		# Wait 10 seconds for non permanent errors and retry
+		if ($PSItem.Exception.Response.StatusCode -eq 429 -or $PSItem.Exception.Response.StatusCode -eq 503) {
+			Write-Host "Gallery returned $($PSItem.Exception.Response.StatusCode) $($PSItem.Exception.Message). Waiting 10 seconds and retrying."
+			Start-Sleep -Seconds 10
+			continue
 		}
 	}
 
 	$onDiskPackageCount = (Get-Item $PWD\*.nupkg).Count
+	if ($packages.count -eq 0) {
+		Write-Host 'No packages found'
+		if ($onDiskPackageCount -eq 0) {
+			Write-Host 'No packages left on disk'
+			if ($firstScan) {
+				Write-Host 'No packages found in gallery since checkpoint. Exiting.'
+				exit 0
+			} else {
+				Write-Host 'No more packages to process! Exiting.'
+			}
+			break
+		} else {
+			Write-Host "$onDiskPackageCount packages left on disk. Processing them."
+		}
+		$processLastBatch = $true
+	}
+	$firstScan = $false
+
+	Write-Host "Downloading $($packages.count) packages"
+	$packages | ForEach-Object -Throttle $concurrentDownloads -Parallel {
+		$maxDownloadRetries = 3
+		for ($attempt = 1; $attempt -le $maxDownloadRetries; $attempt++) {
+			try {
+				Invoke-WebRequest $PSItem.content.src -OutFile "$(New-Guid).nupkg" -ErrorAction Stop
+				break
+			} catch {
+				if ($attempt -ge $maxDownloadRetries) {
+					throw "Failed to download package $($PSItem.id) $($PSItem.version) after $maxDownloadRetries attempts: $($PSItem.Exception.Message)"
+				}
+				Write-Host "Failed to download package $($PSItem.id) $($PSItem.version): $($PSItem.Exception.Message). Retrying in 5 seconds ($attempt/$maxDownloadRetries)."
+				Start-Sleep -Seconds 5
+			}
+		}
+	}
+
+	$onDiskPackageCount = (Get-Item $PWD\*.nupkg).Count
+
+	if ($packages.count -gt 0) {
+		$SCRIPT:newCheckpoint = $packages[-1].Properties.Created.'#text'
+		Write-Host "New checkpoint: $SCRIPT:newCheckpoint"
+		if (-not $SCRIPT:newCheckpoint) {
+			throw 'No Created property found on last package. This is a bug.'
+		}
+	}
+
 	if (-not $processLastBatch -and $onDiskPackageCount -lt $processBatchSize) {
 		Write-Host "Batch size of $onDiskPackageCount does not yet meet process size of $processBatchSize. Fetching more packages."
+		$i += $downloadBatchSize
 		continue
 	}
-	Write-Host "Processing batch of $onDiskPackageCount packages"
 
+	Write-Host "Processing batch of $onDiskPackageCount packages"
 	& sleet push --skip-existing $PWD
-	if (-not $newCheckpoint) { throw 'No Created date found on last package in batch. This is a bug' }
-	Set-AzBlobContent -Uri $checkpointPath -Content $newCheckpoint
-	Write-Host "Checkpoint Rolled Forward to: $newCheckpoint"
+
 	$processed += (Get-Item -Path $PWD\*.nupkg).Count
 	Remove-Item -Path $PWD\*.nupkg -Force
+
+	if (-not $SCRIPT:newCheckpoint) {
+		throw 'No new checkpoint found after processing batch. This is a bug.'
+	}
+	Write-Host "Checkpoint roll forward to $SCRIPT:newCheckpoint"
+	Set-AzBlobContent -Uri $checkpointPath -Content $SCRIPT:newCheckpoint
+
 	if ($processLastBatch) { "$processed Packages Processed"; break }
 }
